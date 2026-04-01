@@ -1,0 +1,20 @@
+[project]
+name = "quantgemma"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.0.0",
+    "pyarrow>=19.0.0",
+    "torch==2.11.0",
+    "transformers>=5.3.0",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130" }
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
