@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Prepare tokenized sequences from raw Binance futures parquet files.
 
-Reads 1-min BTCUSDT data, aggregates to 5-min bars, computes Z and V features,
-splits 80/10/10 by time, fits bin edges on train, builds token slot sequences,
-and writes per-split parquets + dataset.toml to data/prepared/v1.
+Reads 1-min data for all available symbols, aggregates to 5-min bars,
+computes Z and V features, splits 80/10/10 by time per symbol, fits global
+bin edges on all train data combined, builds token slot sequences, and writes
+per-split parquets + dataset.toml to data/prepared/v2.
 
 Usage:
   uv run scripts/prepare.py
@@ -19,8 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 RAW_DIR     = Path("data/binance_futures")
-OUT_DIR     = Path("data/prepared/v1")
-SYMBOL      = "BTCUSDT"
+OUT_DIR     = Path("data/prepared/v2")
 
 M           = 5     # bar interval (minutes)
 SIGMA_WIN   = 288   # rolling std window (m-min bars, ~1 day)
@@ -40,15 +40,18 @@ TOD_OFF = 7
 Z_OFF   = 7 + K_TOD
 V_OFF   = 7 + K_TOD + K_Z
 
+# Minimum number of sequences required to include a symbol
+MIN_TRAIN_SEQS = 10
 
-def load_1m_bars() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load all 1-min parquet files for SYMBOL.
+
+def load_1m_bars(symbol: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load all 1-min parquet files for a symbol.
 
     Returns (open_times_ms, closes, quote_volumes) sorted by time, deduped.
     """
-    files = sorted((RAW_DIR / SYMBOL).glob(f"{SYMBOL}-1m-*.parquet"))
+    files = sorted((RAW_DIR / symbol).glob(f"{symbol}-1m-*.parquet"))
     if not files:
-        raise FileNotFoundError(f"No parquet files found in {RAW_DIR / SYMBOL}")
+        raise FileNotFoundError(f"no parquet files in {RAW_DIR / symbol}")
 
     chunks_t, chunks_c, chunks_v = [], [], []
     for f in files:
@@ -169,40 +172,90 @@ def build_sequences(
     return rows
 
 
+def load_symbol_features(symbol: str) -> dict | None:
+    """Load and compute features for a single symbol. Returns None on failure."""
+    try:
+        t1m, c1m, qv1m = load_1m_bars(symbol)
+        bar_ts, bar_close, bar_vol = aggregate_bars(t1m, c1m, qv1m)
+        feats = compute_features(bar_ts, bar_close, bar_vol)
+        if len(feats["ts"]) < SEQ_BARS * 2:
+            return None
+        splits = assign_splits(len(feats["ts"]))
+        return {"feats": feats, "splits": splits}
+    except Exception:
+        return None
+
+
 def main() -> None:
     t0 = time.time()
-    print(f"Loading {SYMBOL} 1-min data ...")
-    t1m, c1m, qv1m = load_1m_bars()
-    print(f"  {len(t1m)} 1-min bars")
+    sys.stdout.reconfigure(line_buffering=True)
 
-    bar_ts, bar_close, bar_vol = aggregate_bars(t1m, c1m, qv1m)
-    feats  = compute_features(bar_ts, bar_close, bar_vol)
-    splits = assign_splits(len(feats["ts"]))
-    print(f"  {len(feats['ts'])} {M}-min bars after warmup")
+    symbols = sorted(d.name for d in RAW_DIR.iterdir() if d.is_dir())
+    print(f"Found {len(symbols)} symbols")
 
-    train_mask = splits == "train"
-    z_edges = quantile_edges(feats["Z"][train_mask], K_Z)
-    v_edges = quantile_edges(feats["V"][train_mask], K_V)
-    print(f"  Bin edges fit on {train_mask.sum()} train bars")
+    # Pass 1: collect only train Z/V for global bin fitting (one symbol at a time)
+    print("Pass 1: fitting bin edges ...")
+    all_train_z, all_train_v = [], []
+    valid_symbols: list[str] = []
 
-    z_b   = to_bins(feats["Z"],   z_edges, K_Z)
-    v_b   = to_bins(feats["V"],   v_edges, K_V)
-    tod_b = np.clip(feats["ToD"], 0, K_TOD - 1)
-    dow_b = np.clip(feats["DoW"], 0, 6)
-
-    counts: dict[str, int] = {"train": 0, "val": 0, "test": 0}
-    for split_name in ("train", "val", "test"):
-        mask = splits == split_name
-        rows = build_sequences(
-            ts=feats["ts"][mask], z_bins=z_b[mask], v_bins=v_b[mask],
-            tod_bins=tod_b[mask], dow_bins=dow_b[mask], split=split_name,
-        )
-        if not rows["token_slots"]:
+    for symbol in symbols:
+        data = load_symbol_features(symbol)
+        if data is None:
             continue
-        counts[split_name] = len(rows["token_slots"])
-        path = OUT_DIR / f"split={split_name}" / "part-0.parquet"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.Table.from_pydict(rows), path, compression="snappy")
+        train_mask = data["splits"] == "train"
+        if train_mask.sum() < SEQ_BARS:
+            continue
+        valid_symbols.append(symbol)
+        all_train_z.append(data["feats"]["Z"][train_mask])
+        all_train_v.append(data["feats"]["V"][train_mask])
+
+    print(f"  {len(valid_symbols)} valid symbols ({time.time() - t0:.0f}s)")
+
+    z_edges = quantile_edges(np.concatenate(all_train_z), K_Z)
+    v_edges = quantile_edges(np.concatenate(all_train_v), K_V)
+    n_train_bars = sum(len(z) for z in all_train_z)
+    print(f"  bin edges fit on {n_train_bars:,} train bars")
+
+    # Free pass-1 memory
+    del all_train_z, all_train_v
+
+    # Pass 2: re-load each symbol, build sequences, write incrementally to parquet
+    print("Pass 2: building sequences ...")
+    writers: dict[str, pq.ParquetWriter] = {}
+    counts: dict[str, int] = {"train": 0, "val": 0, "test": 0}
+
+    for i, symbol in enumerate(valid_symbols):
+        data = load_symbol_features(symbol)
+        if data is None:
+            continue
+        feats  = data["feats"]
+        splits = data["splits"]
+        z_b    = to_bins(feats["Z"],   z_edges, K_Z)
+        v_b    = to_bins(feats["V"],   v_edges, K_V)
+        tod_b  = np.clip(feats["ToD"], 0, K_TOD - 1)
+        dow_b  = np.clip(feats["DoW"], 0, 6)
+
+        for split_name in ("train", "val", "test"):
+            mask = splits == split_name
+            rows = build_sequences(
+                ts=feats["ts"][mask], z_bins=z_b[mask], v_bins=v_b[mask],
+                tod_bins=tod_b[mask], dow_bins=dow_b[mask], split=split_name,
+            )
+            if not rows["token_slots"]:
+                continue
+            table = pa.Table.from_pydict(rows)
+            if split_name not in writers:
+                path = OUT_DIR / f"split={split_name}" / "part-0.parquet"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                writers[split_name] = pq.ParquetWriter(path, table.schema, compression="snappy")
+            writers[split_name].write_table(table)
+            counts[split_name] += len(rows["token_slots"])
+
+        if (i + 1) % 100 == 0:
+            print(f"  {i + 1}/{len(valid_symbols)} symbols processed")
+
+    for w in writers.values():
+        w.close()
 
     print(f"  train={counts['train']}  val={counts['val']}  test={counts['test']}")
     print(f"  output={OUT_DIR}  ({time.time() - t0:.0f}s)")

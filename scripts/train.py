@@ -29,7 +29,7 @@ from transformers import AutoTokenizer, Gemma3ForCausalLM
 # Parameters
 # ---------------------------------------------------------------------------
 
-DATA_DIR    = Path("data/prepared/v1")
+DATA_DIR    = Path("data/prepared/v2")
 MODEL_PATH  = Path("../quantgemma-research/models/gemma-3-270m")
 CKPT_DIR    = Path("models/checkpoints")
 
@@ -38,7 +38,7 @@ MLFLOW_EXPERIMENT = "quantgemma"
 MLFLOW_ARTIFACTS  = "gs://quantgemma/mlflow-artifacts"
 
 TIME_BUDGET  = 3600       # seconds
-MAX_STEPS    = 1000       # hard step limit (set to None to rely on TIME_BUDGET only)
+MAX_STEPS    = None       # hard step limit (set to None to rely on TIME_BUDGET only)
 BATCH_SIZE   = 8
 LR           = 3e-5
 WEIGHT_DECAY = 0.05
@@ -54,14 +54,38 @@ EVAL_BATCHES = 32         # batches for validation loss estimate
 # ---------------------------------------------------------------------------
 
 def load_split(split: str, slot_to_id: np.ndarray) -> np.ndarray:
-    """Load token_slots for a split, map to model token IDs, pad to max length."""
-    f = pq.ParquetFile(DATA_DIR / f"split={split}" / "part-0.parquet")
-    seqs = f.read().column("token_slots").to_pylist()
-    max_len = max(len(s) for s in seqs)
-    pad_id  = int(slot_to_id[0])   # use slot-0 token as pad (arbitrary, masked in loss)
-    out = np.full((len(seqs), max_len), pad_id, dtype=np.int32)
-    for i, s in enumerate(seqs):
-        out[i, :len(s)] = slot_to_id[s]
+    """Load token_slots for a split, map to model token IDs, pad to max length.
+
+    Reads parquet in batches to avoid materializing all Python lists at once
+    (which would use ~20 GB for 3.7M sequences).
+    """
+    path = DATA_DIR / f"split={split}" / "part-0.parquet"
+    pf = pq.ParquetFile(path)
+    n_rows = pf.metadata.num_rows
+    batch_size = 100_000
+
+    # Pass 1: find max sequence length
+    max_len = 0
+    for batch in pf.iter_batches(batch_size=batch_size, columns=["token_slots"]):
+        col = batch.column("token_slots")
+        offsets = col.offsets.to_numpy()
+        lengths = offsets[1:] - offsets[:-1]
+        max_len = max(max_len, int(lengths.max()))
+
+    # Pass 2: fill pre-allocated array
+    pad_id = int(slot_to_id[0])
+    out = np.full((n_rows, max_len), pad_id, dtype=np.int32)
+    row = 0
+    for batch in pf.iter_batches(batch_size=batch_size, columns=["token_slots"]):
+        col = batch.column("token_slots")
+        offsets = col.offsets.to_numpy()
+        flat_ids = slot_to_id[col.values.to_numpy()]
+        for j in range(len(col)):
+            s, e = int(offsets[j]), int(offsets[j + 1])
+            out[row, :e - s] = flat_ids[s:e]
+            row += 1
+
+    print(f"  {split}: {n_rows} sequences, max_len={max_len}")
     return out
 
 
