@@ -15,7 +15,12 @@ from pathlib import Path
 
 sys.stdout.reconfigure(line_buffering=True)
 
+import os
+
+import mlflow
 import numpy as np
+
+os.environ.setdefault("MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT", "-1")
 import pyarrow.parquet as pq
 import torch
 from transformers import AutoTokenizer, Gemma3ForCausalLM
@@ -27,6 +32,10 @@ from transformers import AutoTokenizer, Gemma3ForCausalLM
 DATA_DIR    = Path("data/prepared/v1")
 MODEL_PATH  = Path("../quantgemma-research/models/gemma-3-270m")
 CKPT_DIR    = Path("models/checkpoints")
+
+MLFLOW_DB         = "sqlite:///mlflow.db"
+MLFLOW_EXPERIMENT = "quantgemma"
+MLFLOW_ARTIFACTS  = "gs://quantgemma/mlflow-artifacts"
 
 TIME_BUDGET  = 3600       # seconds
 MAX_STEPS    = 1000       # hard step limit (set to None to rely on TIME_BUDGET only)
@@ -60,11 +69,20 @@ def load_split(split: str, slot_to_id: np.ndarray) -> np.ndarray:
 # Training
 # ---------------------------------------------------------------------------
 
+def _setup_mlflow() -> None:
+    mlflow.set_tracking_uri(MLFLOW_DB)
+    if mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT) is None:
+        mlflow.create_experiment(MLFLOW_EXPERIMENT, artifact_location=MLFLOW_ARTIFACTS)
+    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+
 def train() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     assert torch.cuda.is_available(), "CUDA required"
     device = torch.device("cuda")
+
+    _setup_mlflow()
 
     # Build slot -> token ID mapping from tokenizer
     tok = AutoTokenizer.from_pretrained(str(MODEL_PATH), local_files_only=True)
@@ -104,69 +122,110 @@ def train() -> None:
     warmup_steps  = max(1, int(total_steps * WARMUP_FRAC))
     print(f"probe: {steps_per_sec:.2f} steps/s → {total_steps} total steps, {warmup_steps} warmup")
 
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return step / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + np.cos(np.pi * progress))
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    run_name = f"{timestamp}_bs{BATCH_SIZE}_lr{LR:.0e}_wd{WEIGHT_DECAY}"
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_params({
+            "batch_size":    BATCH_SIZE,
+            "lr":            LR,
+            "weight_decay":  WEIGHT_DECAY,
+            "warmup_frac":   WARMUP_FRAC,
+            "max_norm":      MAX_NORM,
+            "seed":          SEED,
+            "time_budget":   TIME_BUDGET,
+            "total_steps":   total_steps,
+            "seq_len":       seq_len,
+            "data_dir":      str(DATA_DIR),
+        })
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return step / warmup_steps
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + np.cos(np.pi * progress))
 
-    # Training loop
-    t_start = time.time() - probe_sec
-    step = 0
-    model.train()
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    while time.time() - t_start < TIME_BUDGET and (MAX_STEPS is None or step < MAX_STEPS):
-        idx   = rng.integers(0, len(train_ids), BATCH_SIZE)
-        batch = torch.tensor(train_ids[idx], dtype=torch.long, device=device)
-        loss  = model(input_ids=batch, labels=batch).loss
-
-        if torch.isnan(loss) or loss.item() > 100:
-            print(f"ABORT: loss={loss.item():.4f} at step {step}")
-            break
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_NORM)
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
-        step += 1
-
-        if step % LOG_EVERY == 0:
-            elapsed = time.time() - t_start
-            print(f"  step {step:5d} | loss={loss.item():.4f} | lr={scheduler.get_last_lr()[0]*LR:.2e} | {elapsed:.0f}s")
-
-    training_seconds = time.time() - t_start
-
-    # Evaluation
-    @torch.no_grad()
-    def eval_loss(ids: np.ndarray) -> float:
-        model.eval()
-        total = 0.0
-        for i in range(EVAL_BATCHES):
-            idx   = rng.integers(0, len(ids), BATCH_SIZE)
-            batch = torch.tensor(ids[idx], dtype=torch.long, device=device)
-            total += model(input_ids=batch, labels=batch).loss.item()
+        # Training loop
+        t_start = time.time() - probe_sec
+        step = 0
         model.train()
-        return total / EVAL_BATCHES
 
-    val_loss   = eval_loss(val_ids)
-    train_loss = eval_loss(train_ids)
-    peak_vram  = torch.cuda.max_memory_allocated() / 1024 ** 2
+        while time.time() - t_start < TIME_BUDGET and (MAX_STEPS is None or step < MAX_STEPS):
+            idx   = rng.integers(0, len(train_ids), BATCH_SIZE)
+            batch = torch.tensor(train_ids[idx], dtype=torch.long, device=device)
+            loss  = model(input_ids=batch, labels=batch).loss
 
-    # Save checkpoint
-    ckpt_name = f"v1_bs{BATCH_SIZE}_lr{LR:.0e}_steps{step}"
-    ckpt_path = CKPT_DIR / ckpt_name
-    ckpt_path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(ckpt_path))
-    print(f"checkpoint:        {ckpt_path}")
+            if torch.isnan(loss) or loss.item() > 100:
+                print(f"ABORT: loss={loss.item():.4f} at step {step}")
+                break
 
-    print(f"val_loss:          {val_loss:.6f}")
-    print(f"train_loss:        {train_loss:.6f}")
-    print(f"peak_vram_mb:      {peak_vram:.1f}")
-    print(f"training_seconds:  {training_seconds:.1f}")
-    print(f"total_steps:       {step}")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_NORM)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+
+            if step % LOG_EVERY == 0:
+                elapsed = time.time() - t_start
+                current_lr = scheduler.get_last_lr()[0] * LR
+                print(f"  step {step:5d} | loss={loss.item():.4f} | lr={current_lr:.2e} | {elapsed:.0f}s")
+                mlflow.log_metric("train_loss", loss.item(), step=step)
+                mlflow.log_metric("lr", current_lr, step=step)
+
+        training_seconds = time.time() - t_start
+
+        # Evaluation
+        @torch.no_grad()
+        def eval_loss(ids: np.ndarray) -> float:
+            model.eval()
+            total = 0.0
+            for i in range(EVAL_BATCHES):
+                idx   = rng.integers(0, len(ids), BATCH_SIZE)
+                batch = torch.tensor(ids[idx], dtype=torch.long, device=device)
+                total += model(input_ids=batch, labels=batch).loss.item()
+            model.train()
+            return total / EVAL_BATCHES
+
+        val_loss   = eval_loss(val_ids)
+        train_loss = eval_loss(train_ids)
+        peak_vram  = torch.cuda.max_memory_allocated() / 1024 ** 2
+
+        mlflow.log_metrics({
+            "val_loss":         val_loss,
+            "train_loss_final": train_loss,
+            "peak_vram_mb":     peak_vram,
+            "training_seconds": training_seconds,
+            "steps_completed":  step,
+        })
+
+        # Save checkpoint locally
+        ckpt_name = f"v1_bs{BATCH_SIZE}_lr{LR:.0e}_steps{step}"
+        ckpt_path = CKPT_DIR / ckpt_name
+        ckpt_path.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(str(ckpt_path))
+        print(f"checkpoint:        {ckpt_path}")
+
+        # Upload to GCS only if this is the best val_loss so far
+        finished_runs = mlflow.search_runs(
+            experiment_names=[MLFLOW_EXPERIMENT],
+            filter_string="status = 'FINISHED'",
+        )
+        best_val_loss = finished_runs["metrics.val_loss"].min() if not finished_runs.empty else float("inf")
+        if val_loss < best_val_loss:
+            print(f"new best val_loss {val_loss:.6f} (prev {best_val_loss:.6f}) — uploading to GCS")
+            mlflow.log_artifacts(str(ckpt_path),       artifact_path="checkpoint")
+            mlflow.log_artifact("scripts/train.py",    artifact_path="source")
+            mlflow.log_artifact("scripts/prepare.py",  artifact_path="source")
+        else:
+            print(f"val_loss {val_loss:.6f} >= best {best_val_loss:.6f} — skipping GCS upload")
+
+        print(f"val_loss:          {val_loss:.6f}")
+        print(f"train_loss:        {train_loss:.6f}")
+        print(f"peak_vram_mb:      {peak_vram:.1f}")
+        print(f"training_seconds:  {training_seconds:.1f}")
+        print(f"total_steps:       {step}")
 
 
 if __name__ == "__main__":
