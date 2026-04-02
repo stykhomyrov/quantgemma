@@ -29,7 +29,7 @@ from transformers import AutoTokenizer, Gemma3ForCausalLM
 # Parameters
 # ---------------------------------------------------------------------------
 
-DATA_DIR    = Path("data/prepared/v3")
+DATA_DIR    = Path("data/prepared/v4")
 BASE_PATH   = Path("../quantgemma-research/models/gemma-3-270m")  # tokenizer
 MODEL_PATH  = Path("../quantgemma-research/models/gemma-3-270m")
 CKPT_DIR    = Path("models/checkpoints")
@@ -41,7 +41,7 @@ MLFLOW_ARTIFACTS  = "gs://quantgemma/mlflow-artifacts"
 TIME_BUDGET  = 3600       # seconds
 MAX_STEPS    = None       # hard step limit (set to None to rely on TIME_BUDGET only)
 BATCH_SIZE   = 8
-LR           = 5e-6
+LR           = 3e-5
 WEIGHT_DECAY = 0.05
 WARMUP_FRAC  = 0.05
 MAX_NORM     = 1.0

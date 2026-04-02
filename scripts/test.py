@@ -33,15 +33,15 @@ from transformers import AutoTokenizer, Gemma3ForCausalLM
 # Parameters - must match prepare.py and train.py
 # ---------------------------------------------------------------------------
 
-DATA_DIR   = Path("data/prepared/v3")
-MODEL_PATH = Path("models/checkpoints/v1_bs8_lr5e-06_steps9990")
+DATA_DIR   = Path("data/prepared/v4")
+MODEL_PATH = Path("models/checkpoints/v1_bs8_lr3e-05_steps8500")
 BASE_PATH  = Path("../quantgemma-research/models/gemma-3-270m")  # for tokenizer
 
 Z_OFF  = 15    # first Z slot index
 K_Z    = 24    # number of Z bins
 Z_MID  = K_Z // 2   # bins >= Z_MID -> up, < Z_MID -> down
 
-SEQ_BARS = 64  # bars per sequence
+SEQ_BARS = 128  # bars per sequence
 BATCH_READ  = 50_000  # parquet read batch size
 INFER_BATCH = 32      # sequences per GPU forward pass
 
