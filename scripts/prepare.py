@@ -20,10 +20,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 RAW_DIR     = Path("data/binance_futures")
-OUT_DIR     = Path("data/prepared/v2")
+OUT_DIR     = Path("data/prepared/v3")
 
-M           = 5     # bar interval (minutes)
-SIGMA_WIN   = 288   # rolling std window (m-min bars, ~1 day)
+M           = 10    # bar interval (minutes)
+SIGMA_WIN   = 144   # rolling std window (m-min bars, ~1 day)
 K_Z         = 24    # Z bins
 K_V         = 24    # V bins
 K_TOD       = 8     # time-of-day slots

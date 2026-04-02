@@ -29,7 +29,8 @@ from transformers import AutoTokenizer, Gemma3ForCausalLM
 # Parameters
 # ---------------------------------------------------------------------------
 
-DATA_DIR    = Path("data/prepared/v2")
+DATA_DIR    = Path("data/prepared/v3")
+BASE_PATH   = Path("../quantgemma-research/models/gemma-3-270m")  # tokenizer
 MODEL_PATH  = Path("../quantgemma-research/models/gemma-3-270m")
 CKPT_DIR    = Path("models/checkpoints")
 
@@ -40,7 +41,7 @@ MLFLOW_ARTIFACTS  = "gs://quantgemma/mlflow-artifacts"
 TIME_BUDGET  = 3600       # seconds
 MAX_STEPS    = None       # hard step limit (set to None to rely on TIME_BUDGET only)
 BATCH_SIZE   = 8
-LR           = 3e-5
+LR           = 5e-6
 WEIGHT_DECAY = 0.05
 WARMUP_FRAC  = 0.05
 MAX_NORM     = 1.0
@@ -109,7 +110,7 @@ def train() -> None:
     _setup_mlflow()
 
     # Build slot -> token ID mapping from tokenizer
-    tok = AutoTokenizer.from_pretrained(str(MODEL_PATH), local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(str(BASE_PATH), local_files_only=True)
     slot_to_id = np.array(
         [tok.convert_tokens_to_ids(f"<unused{i}>") for i in range(73)], dtype=np.int32
     )

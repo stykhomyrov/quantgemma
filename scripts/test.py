@@ -33,8 +33,8 @@ from transformers import AutoTokenizer, Gemma3ForCausalLM
 # Parameters - must match prepare.py and train.py
 # ---------------------------------------------------------------------------
 
-DATA_DIR   = Path("data/prepared/v2")
-MODEL_PATH = Path("models/checkpoints/v1_bs8_lr3e-05_steps9742")
+DATA_DIR   = Path("data/prepared/v3")
+MODEL_PATH = Path("models/checkpoints/v1_bs8_lr5e-06_steps9990")
 BASE_PATH  = Path("../quantgemma-research/models/gemma-3-270m")  # for tokenizer
 
 Z_OFF  = 15    # first Z slot index
